@@ -18,6 +18,8 @@ For a high level usage example, see the [BotWheel Explorer ROS2 Package](../odri
 - Torque Control
 - Automatic control mode selection (based on which Command Interfaces are claimed by the ros2_control Controller)
 - Position, velocity and torque Feedback
+- Current setpoint and measured current feedback (`iq_setpoint` and
+  `iq_measured` custom state interfaces)
 - Multiple ODrives
 
 **TODO:**
@@ -38,6 +40,9 @@ Top level:
 Per joint:
 
 - `node_id`: `node_id` of the ODrive
+- `trap_vel_limit`, `trap_accel_limit`, `trap_decel_limit` (optional): Enable
+  ODrive's trapezoidal trajectory input mode for position control. All three
+  must be specified and positive. Units are rad/s and rad/s^2.
 
 ## Command Interfaces
 
@@ -46,6 +51,12 @@ Per joint:
 - `position`
 - `velocity`
 - `effort` (aka Torque)
+- `iq_setpoint` (A)
+- `iq_measured` (A)
+
+The ODrive must be configured to transmit `Get_Iq` cyclically for the current
+interfaces to update. `joint_state_broadcaster` publishes these custom
+interfaces on `/dynamic_joint_states`.
 
 ## State Interfaces
 

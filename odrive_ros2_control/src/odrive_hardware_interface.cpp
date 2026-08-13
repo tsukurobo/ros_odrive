@@ -80,8 +80,8 @@ struct Axis {
     // uint8_t trajectory_done_flag_ = 0;
     double pos_estimate_ = NAN; // [rad]
     double vel_estimate_ = NAN; // [rad/s]
-    // double iq_setpoint_ = NAN;
-    // double iq_measured_ = NAN;
+    double iq_setpoint_ = NAN; // [A]
+    double iq_measured_ = NAN; // [A]
     double torque_target_ = NAN; // [Nm]
     double torque_estimate_ = NAN; // [Nm]
     // uint32_t active_errors_ = 0;
@@ -99,6 +99,13 @@ struct Axis {
     bool pos_input_enabled_ = false;
     bool vel_input_enabled_ = false;
     bool torque_input_enabled_ = false;
+
+    // Optional ODrive-side trapezoidal trajectory limits. The hardware
+    // interface uses SI units; CAN Simple uses revolutions.
+    double trap_vel_limit_ = 0.0; // [rad/s]
+    double trap_accel_limit_ = 0.0; // [rad/s^2]
+    double trap_decel_limit_ = 0.0; // [rad/s^2]
+    bool trap_traj_enabled_ = false;
 
     template <typename T>
     void send(const T& msg) const {
@@ -133,6 +140,39 @@ CallbackReturn ODriveHardwareInterface::on_init(const hardware_interface::Hardwa
             index_search != joint.parameters.end() &&
             (index_search->second == "true" || index_search->second == "1");
         axis.ready_for_control_ = !axis.index_search_on_activate_;
+
+        const auto trap_vel = joint.parameters.find("trap_vel_limit");
+        const auto trap_accel = joint.parameters.find("trap_accel_limit");
+        const auto trap_decel = joint.parameters.find("trap_decel_limit");
+        const bool has_any_trap_limit =
+            trap_vel != joint.parameters.end() || trap_accel != joint.parameters.end() ||
+            trap_decel != joint.parameters.end();
+        const bool has_all_trap_limits =
+            trap_vel != joint.parameters.end() && trap_accel != joint.parameters.end() &&
+            trap_decel != joint.parameters.end();
+        if (has_any_trap_limit && !has_all_trap_limits) {
+            RCLCPP_ERROR(
+                rclcpp::get_logger("ODriveHardwareInterface"),
+                "Joint %s must specify trap_vel_limit, trap_accel_limit and trap_decel_limit together",
+                joint.name.c_str()
+            );
+            return CallbackReturn::ERROR;
+        }
+        if (has_all_trap_limits) {
+            axis.trap_vel_limit_ = std::stod(trap_vel->second);
+            axis.trap_accel_limit_ = std::stod(trap_accel->second);
+            axis.trap_decel_limit_ = std::stod(trap_decel->second);
+            if (axis.trap_vel_limit_ <= 0.0 || axis.trap_accel_limit_ <= 0.0 ||
+                axis.trap_decel_limit_ <= 0.0) {
+                RCLCPP_ERROR(
+                    rclcpp::get_logger("ODriveHardwareInterface"),
+                    "Trapezoidal trajectory limits for joint %s must be positive",
+                    joint.name.c_str()
+                );
+                return CallbackReturn::ERROR;
+            }
+            axis.trap_traj_enabled_ = true;
+        }
     }
 
     return CallbackReturn::SUCCESS;
@@ -203,6 +243,16 @@ std::vector<hardware_interface::StateInterface> ODriveHardwareInterface::export_
             info_.joints[i].name,
             hardware_interface::HW_IF_POSITION,
             &axes_[i].pos_estimate_
+        ));
+        state_interfaces.emplace_back(hardware_interface::StateInterface(
+            info_.joints[i].name,
+            "iq_setpoint",
+            &axes_[i].iq_setpoint_
+        ));
+        state_interfaces.emplace_back(hardware_interface::StateInterface(
+            info_.joints[i].name,
+            "iq_measured",
+            &axes_[i].iq_measured_
         ));
     }
 
@@ -409,6 +459,25 @@ void ODriveHardwareInterface::set_axis_command_mode(Axis& axis) {
     if (axis.pos_input_enabled_) {
         RCLCPP_INFO(rclcpp::get_logger("ODriveHardwareInterface"), "Setting to position control.");
         control_msg.Control_Mode = CONTROL_MODE_POSITION_CONTROL;
+        if (axis.trap_traj_enabled_) {
+            Set_Traj_Vel_Limit_msg_t vel_limit_msg;
+            vel_limit_msg.Traj_Vel_Limit = axis.trap_vel_limit_ / (2 * M_PI);
+            axis.send(vel_limit_msg);
+
+            Set_Traj_Accel_Limits_msg_t accel_limits_msg;
+            accel_limits_msg.Traj_Accel_Limit = axis.trap_accel_limit_ / (2 * M_PI);
+            accel_limits_msg.Traj_Decel_Limit = axis.trap_decel_limit_ / (2 * M_PI);
+            axis.send(accel_limits_msg);
+
+            control_msg.Input_Mode = INPUT_MODE_TRAP_TRAJ;
+            RCLCPP_INFO(
+                rclcpp::get_logger("ODriveHardwareInterface"),
+                "Using trapezoidal trajectory: velocity=%.3f rad/s, acceleration=%.3f rad/s^2, deceleration=%.3f rad/s^2",
+                axis.trap_vel_limit_,
+                axis.trap_accel_limit_,
+                axis.trap_decel_limit_
+            );
+        }
     } else if (axis.vel_input_enabled_) {
         RCLCPP_INFO(rclcpp::get_logger("ODriveHardwareInterface"), "Setting to velocity control.");
         control_msg.Control_Mode = CONTROL_MODE_VELOCITY_CONTROL;
@@ -458,6 +527,12 @@ void Axis::on_can_msg(const rclcpp::Time&, const can_frame& frame) {
             if (Get_Torques_msg_t msg; try_decode(msg)) {
                 torque_target_ = msg.Torque_Target;
                 torque_estimate_ = msg.Torque_Estimate;
+            }
+        } break;
+        case Get_Iq_msg_t::cmd_id: {
+            if (Get_Iq_msg_t msg; try_decode(msg)) {
+                iq_setpoint_ = msg.Iq_Setpoint;
+                iq_measured_ = msg.Iq_Measured;
             }
         } break;
             // silently ignore unimplemented command IDs
