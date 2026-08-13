@@ -36,9 +36,11 @@ public:
 
 private:
     void on_can_msg(const can_frame& frame);
-    void set_axis_command_mode(const Axis& axis);
+    void set_axis_command_mode(Axis& axis);
+    void start_index_search(Axis& axis);
+    void update_index_search(Axis& axis);
 
-    bool active_;
+    bool active_ = false;
     EpollEventLoop event_loop_;
     std::vector<Axis> axes_;
     std::string can_intf_name_;
@@ -55,6 +57,15 @@ struct Axis {
 
     SocketCanIntf* can_intf_;
     uint32_t node_id_;
+
+    bool index_search_on_activate_ = false;
+    bool index_search_requested_ = false;
+    bool index_search_started_ = false;
+    bool ready_for_control_ = true;
+    bool heartbeat_received_ = false;
+    uint32_t axis_error_ = 0;
+    uint8_t axis_state_ = AXIS_STATE_UNDEFINED;
+    uint8_t procedure_result_ = PROCEDURE_RESULT_SUCCESS;
 
     // Commands (ros2_control => ODrives)
     double pos_setpoint_ = 0.0f; // [rad]
@@ -91,7 +102,7 @@ struct Axis {
 
     template <typename T>
     void send(const T& msg) const {
-        struct can_frame frame;
+        struct can_frame frame{};
         frame.can_id = node_id_ << 5 | msg.cmd_id;
         frame.can_dlc = msg.msg_length;
         msg.encode_buf(frame.data);
@@ -116,6 +127,12 @@ CallbackReturn ODriveHardwareInterface::on_init(const hardware_interface::Hardwa
 
     for (auto& joint : info_.joints) {
         axes_.emplace_back(&can_intf_, std::stoi(joint.parameters.at("node_id")));
+        Axis& axis = axes_.back();
+        const auto index_search = joint.parameters.find("index_search_on_activate");
+        axis.index_search_on_activate_ =
+            index_search != joint.parameters.end() &&
+            (index_search->second == "true" || index_search->second == "1");
+        axis.ready_for_control_ = !axis.index_search_on_activate_;
     }
 
     return CallbackReturn::SUCCESS;
@@ -147,7 +164,11 @@ CallbackReturn ODriveHardwareInterface::on_activate(const State&) {
 
     active_ = true;
     for (auto& axis : axes_) {
-        set_axis_command_mode(axis);
+        if (axis.index_search_on_activate_) {
+            start_index_search(axis);
+        } else {
+            set_axis_command_mode(axis);
+        }
     }
 
     return CallbackReturn::SUCCESS;
@@ -258,11 +279,18 @@ return_type ODriveHardwareInterface::read(const rclcpp::Time& timestamp, const r
         // repeat until CAN interface has no more messages
     }
 
+    for (auto& axis : axes_) {
+        update_index_search(axis);
+    }
+
     return return_type::OK;
 }
 
 return_type ODriveHardwareInterface::write(const rclcpp::Time&, const rclcpp::Duration&) {
     for (auto& axis : axes_) {
+        if (!axis.ready_for_control_) {
+            continue;
+        }
         // Send the CAN message that fits the set of enabled setpoints
         if (axis.pos_input_enabled_) {
             Set_Input_Pos_msg_t msg;
@@ -295,12 +323,78 @@ void ODriveHardwareInterface::on_can_msg(const can_frame& frame) {
     }
 }
 
-void ODriveHardwareInterface::set_axis_command_mode(const Axis& axis) {
+void ODriveHardwareInterface::start_index_search(Axis& axis) {
+    RCLCPP_INFO(
+        rclcpp::get_logger("ODriveHardwareInterface"),
+        "Starting encoder index search for ODrive node %u",
+        axis.node_id_
+    );
+
+    Clear_Errors_msg_t clear_error_msg;
+    clear_error_msg.Identify = 0;
+    axis.send(clear_error_msg);
+
+    Set_Axis_State_msg_t state_msg;
+    state_msg.Axis_Requested_State = AXIS_STATE_ENCODER_INDEX_SEARCH;
+    axis.send(state_msg);
+
+    axis.index_search_requested_ = true;
+    axis.index_search_started_ = false;
+    axis.ready_for_control_ = false;
+}
+
+void ODriveHardwareInterface::update_index_search(Axis& axis) {
+    if (!axis.index_search_requested_ || !axis.heartbeat_received_) {
+        return;
+    }
+
+    if (axis.axis_state_ == AXIS_STATE_ENCODER_INDEX_SEARCH) {
+        axis.index_search_started_ = true;
+        return;
+    }
+
+    if (!axis.index_search_started_) {
+        return;
+    }
+
+    if (axis.axis_state_ == AXIS_STATE_IDLE) {
+        axis.index_search_requested_ = false;
+        if (axis.axis_error_ == ODRIVE_ERROR_NONE &&
+            axis.procedure_result_ == PROCEDURE_RESULT_SUCCESS) {
+            axis.ready_for_control_ = true;
+            RCLCPP_INFO(
+                rclcpp::get_logger("ODriveHardwareInterface"),
+                "Encoder index search completed for ODrive node %u",
+                axis.node_id_
+            );
+            set_axis_command_mode(axis);
+        } else {
+            RCLCPP_ERROR(
+                rclcpp::get_logger("ODriveHardwareInterface"),
+                "Encoder index search failed for ODrive node %u: axis_error=0x%08x, procedure_result=%u",
+                axis.node_id_,
+                axis.axis_error_,
+                axis.procedure_result_
+            );
+        }
+    }
+}
+
+void ODriveHardwareInterface::set_axis_command_mode(Axis& axis) {
     if (!active_) {
         RCLCPP_INFO(rclcpp::get_logger("ODriveHardwareInterface"), "Interface inactive. Setting axis to idle.");
         Set_Axis_State_msg_t idle_msg;
         idle_msg.Axis_Requested_State = AXIS_STATE_IDLE;
         axis.send(idle_msg);
+        return;
+    }
+
+    if (!axis.ready_for_control_) {
+        RCLCPP_INFO(
+            rclcpp::get_logger("ODriveHardwareInterface"),
+            "Deferring control mode for ODrive node %u until encoder index search completes",
+            axis.node_id_
+        );
         return;
     }
 
@@ -346,6 +440,14 @@ void Axis::on_can_msg(const rclcpp::Time&, const can_frame& frame) {
     };
 
     switch (cmd) {
+        case Heartbeat_msg_t::cmd_id: {
+            if (Heartbeat_msg_t msg; try_decode(msg)) {
+                axis_error_ = msg.Axis_Error;
+                axis_state_ = msg.Axis_State;
+                procedure_result_ = msg.Procedure_Result;
+                heartbeat_received_ = true;
+            }
+        } break;
         case Get_Encoder_Estimates_msg_t::cmd_id: {
             if (Get_Encoder_Estimates_msg_t msg; try_decode(msg)) {
                 pos_estimate_ = msg.Pos_Estimate * (2 * M_PI);

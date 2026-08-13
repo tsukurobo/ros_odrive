@@ -219,7 +219,7 @@ struct Set_Axis_State_msg_t final {
     }
 
     static const uint8_t cmd_id = 0x007;
-    static const uint8_t msg_length = 8;
+    static const uint8_t msg_length = 4;
     
     uint32_t Axis_Requested_State = 0;
 };

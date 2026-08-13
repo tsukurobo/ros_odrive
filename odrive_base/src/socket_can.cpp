@@ -15,6 +15,7 @@ bool SocketCanIntf::init(const std::string& interface, EpollEventLoop* event_loo
     interface_ = interface;
     event_loop_ = event_loop;
     frame_processor_ = std::move(frame_processor);
+    send_error_reported_ = false;
     socket_id_ = socket(PF_CAN, SOCK_RAW | SOCK_NONBLOCK, CAN_RAW);
     if (socket_id_ == -1) {
         std::cerr << "Failed to create socket" << std::endl;
@@ -77,8 +78,18 @@ void SocketCanIntf::deinit() {
 bool SocketCanIntf::send_can_frame(const can_frame& frame) {
     ssize_t nbytes = write(socket_id_, &frame, sizeof(frame));
     if (nbytes == -1) {
-        std::cerr << "Failed to send CAN frame" << std::endl;
+        if (!send_error_reported_) {
+            std::cerr << "Failed to send CAN frame on " << interface_ << ": "
+                      << std::strerror(errno)
+                      << " (further send errors will be suppressed)" << std::endl;
+            send_error_reported_ = true;
+        }
         return false;
+    }
+
+    if (send_error_reported_) {
+        std::cerr << "CAN frame transmission recovered on " << interface_ << std::endl;
+        send_error_reported_ = false;
     }
 
     return true;
