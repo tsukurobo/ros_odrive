@@ -7,6 +7,7 @@
 #include "pluginlib/class_list_macros.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "socket_can.hpp"
+#include <chrono>
 
 namespace odrive_ros2_control {
 
@@ -39,6 +40,7 @@ private:
     void set_axis_command_mode(Axis& axis);
     void start_index_search(Axis& axis);
     void update_index_search(Axis& axis);
+    void update_connection(Axis& axis);
 
     bool active_ = false;
     EpollEventLoop event_loop_;
@@ -46,6 +48,7 @@ private:
     std::string can_intf_name_;
     SocketCanIntf can_intf_;
     rclcpp::Time timestamp_;
+    std::chrono::milliseconds heartbeat_timeout_{1000};
 };
 
 struct Axis {
@@ -63,6 +66,10 @@ struct Axis {
     bool index_search_started_ = false;
     bool ready_for_control_ = true;
     bool heartbeat_received_ = false;
+    bool connection_recovered_ = false;
+    bool initialization_pending_ = false;
+    bool clear_errors_requested_ = false;
+    std::chrono::steady_clock::time_point last_heartbeat_;
     uint32_t axis_error_ = 0;
     uint8_t axis_state_ = AXIS_STATE_UNDEFINED;
     uint8_t procedure_result_ = PROCEDURE_RESULT_SUCCESS;
@@ -131,6 +138,18 @@ CallbackReturn ODriveHardwareInterface::on_init(const hardware_interface::Hardwa
     }
 
     can_intf_name_ = info_.hardware_parameters["can"];
+    if (const auto timeout = info_.hardware_parameters.find("heartbeat_timeout_ms");
+        timeout != info_.hardware_parameters.end()) {
+        const int timeout_ms = std::stoi(timeout->second);
+        if (timeout_ms <= 0) {
+            RCLCPP_ERROR(
+                rclcpp::get_logger("ODriveHardwareInterface"),
+                "heartbeat_timeout_ms must be positive"
+            );
+            return CallbackReturn::ERROR;
+        }
+        heartbeat_timeout_ = std::chrono::milliseconds(timeout_ms);
+    }
 
     for (auto& joint : info_.joints) {
         axes_.emplace_back(&can_intf_, std::stoi(joint.parameters.at("node_id")));
@@ -204,11 +223,20 @@ CallbackReturn ODriveHardwareInterface::on_activate(const State&) {
 
     active_ = true;
     for (auto& axis : axes_) {
-        if (axis.index_search_on_activate_) {
-            start_index_search(axis);
-        } else {
-            set_axis_command_mode(axis);
+        if (!axis.heartbeat_received_) {
+            RCLCPP_INFO(
+                rclcpp::get_logger("ODriveHardwareInterface"),
+                "Waiting for heartbeat from ODrive node %u before initialization",
+                axis.node_id_
+            );
+            continue;
         }
+
+        // If a heartbeat arrived while the hardware was inactive, activation
+        // handles it here. Do not handle the same connection event again in read().
+        axis.connection_recovered_ = false;
+        axis.initialization_pending_ = true;
+        update_connection(axis);
     }
 
     return CallbackReturn::SUCCESS;
@@ -330,10 +358,77 @@ return_type ODriveHardwareInterface::read(const rclcpp::Time& timestamp, const r
     }
 
     for (auto& axis : axes_) {
+        update_connection(axis);
         update_index_search(axis);
     }
 
     return return_type::OK;
+}
+
+void ODriveHardwareInterface::update_connection(Axis& axis) {
+    if (axis.heartbeat_received_ &&
+        std::chrono::steady_clock::now() - axis.last_heartbeat_ > heartbeat_timeout_) {
+        RCLCPP_WARN(
+            rclcpp::get_logger("ODriveHardwareInterface"),
+            "Heartbeat timed out for ODrive node %u; waiting for it to reconnect",
+            axis.node_id_
+        );
+        axis.heartbeat_received_ = false;
+        axis.connection_recovered_ = false;
+        axis.initialization_pending_ = false;
+        axis.clear_errors_requested_ = false;
+        axis.index_search_requested_ = false;
+        axis.index_search_started_ = false;
+        axis.ready_for_control_ = !axis.index_search_on_activate_;
+    }
+
+    if (axis.connection_recovered_) {
+        axis.connection_recovered_ = false;
+        axis.initialization_pending_ = true;
+        axis.clear_errors_requested_ = false;
+        RCLCPP_INFO(
+            rclcpp::get_logger("ODriveHardwareInterface"),
+            "Heartbeat received from ODrive node %u",
+            axis.node_id_
+        );
+    }
+
+    if (!axis.initialization_pending_ || !active_) {
+        return;
+    }
+
+    // The first heartbeat after power-up can still report INITIALIZING. Sending
+    // an axis-state request during boot can disarm the procedure and leave the
+    // ODrive's LED red, so wait for initialization to finish.
+    if (axis.axis_error_ & ODRIVE_ERROR_INITIALIZING) {
+        return;
+    }
+
+    // Clear a persistent error first, then wait for a subsequent heartbeat to
+    // confirm that it was cleared before starting index search.
+    if (axis.axis_error_ != ODRIVE_ERROR_NONE) {
+        if (!axis.clear_errors_requested_) {
+            RCLCPP_WARN(
+                rclcpp::get_logger("ODriveHardwareInterface"),
+                "ODrive node %u reported axis_error=0x%08x; clearing errors before initialization",
+                axis.node_id_,
+                axis.axis_error_
+            );
+            Clear_Errors_msg_t clear_error_msg;
+            clear_error_msg.Identify = 0;
+            axis.send(clear_error_msg);
+            axis.clear_errors_requested_ = true;
+        }
+        return;
+    }
+
+    axis.initialization_pending_ = false;
+    axis.clear_errors_requested_ = false;
+    if (axis.index_search_on_activate_) {
+        start_index_search(axis);
+    } else {
+        set_axis_command_mode(axis);
+    }
 }
 
 return_type ODriveHardwareInterface::write(const rclcpp::Time&, const rclcpp::Duration&) {
@@ -514,6 +609,10 @@ void Axis::on_can_msg(const rclcpp::Time&, const can_frame& frame) {
                 axis_error_ = msg.Axis_Error;
                 axis_state_ = msg.Axis_State;
                 procedure_result_ = msg.Procedure_Result;
+                last_heartbeat_ = std::chrono::steady_clock::now();
+                if (!heartbeat_received_) {
+                    connection_recovered_ = true;
+                }
                 heartbeat_received_ = true;
             }
         } break;

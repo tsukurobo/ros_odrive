@@ -11,6 +11,12 @@ For information about installation, prerequisites and getting started, check out
 * `node_id`: The node_id of the device this node will attach to
 * `interface`: the network interface name for the can bus
 * `axis_idle_on_shutdown`: Whether to set ODrive to IDLE state when the node is terminated
+* `heartbeat_timeout_ms`: Gap between heartbeats that is considered a disconnect (default: 1000 ms)
+* `request_timeout_ms`: Maximum time the axis-state service waits for confirmation (default: 2000 ms)
+* `trap_vel_limit`, `trap_accel_limit`, `trap_decel_limit`: Optional ODrive
+  trapezoidal trajectory limits in rad/s and rad/s^2. Set all three to positive
+  values to transmit them whenever `input_mode` is `TRAP_TRAJ` (5). All default
+  to zero, which leaves the ODrive's configured limits unchanged.
 
 ### Subscribes to
 
@@ -56,6 +62,11 @@ For information about installation, prerequisites and getting started, check out
   the service waits for the axis state to complete before it returns.
 
   This service requires regular heartbeat messages from the ODrive to function properly. See [configuration instructions](https://docs.odriverobotics.com/v/latest/guides/ros-package.html#setting-up-the-odrive).
+
+  If the ODrive is unavailable, the service returns after `request_timeout_ms`
+  instead of waiting indefinitely. The requested state is retained and sent
+  again automatically when heartbeat communication starts or resumes after a
+  power interruption.
 
   If the requested state is anything other than IDLE, this sends a `clear_errors` request to the ODrive (see below) before sending the state request.
 

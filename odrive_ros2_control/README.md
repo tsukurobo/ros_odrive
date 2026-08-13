@@ -36,6 +36,10 @@ For a high level usage example, see the [BotWheel Explorer ROS2 Package](../odri
 Top level:
 
 - `can`: Name of the CAN interface to run on
+- `heartbeat_timeout_ms` (optional, default: `1000`): Time without an ODrive
+  heartbeat after which the axis is considered disconnected. When heartbeat
+  communication resumes, the plugin repeats activation initialization and
+  requests closed-loop control again.
 
 Per joint:
 

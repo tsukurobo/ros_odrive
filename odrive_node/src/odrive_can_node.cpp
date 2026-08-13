@@ -4,6 +4,7 @@
 #include "byte_swap.hpp"
 #include <sys/eventfd.h>
 #include <chrono>
+#include <cmath>
 
 enum CmdId : uint32_t {
     kHeartbeat = 0x001,            // ControllerStatus  - publisher
@@ -14,6 +15,8 @@ enum CmdId : uint32_t {
     kSetInputPos,                  // ControlMessage    - subscriber
     kSetInputVel,                  // ControlMessage    - subscriber
     kSetInputTorque,               // ControlMessage    - subscriber
+    kSetTrajVelLimit = 0x011,      // ControlMessage    - subscriber
+    kSetTrajAccelLimits = 0x012,   // ControlMessage    - subscriber
     kGetIq = 0x014,                // ControllerStatus  - publisher
     kGetTemp,                      // SystemStatus      - publisher
     kGetBusVoltageCurrent = 0x017, // SystemStatus      - publisher
@@ -28,11 +31,18 @@ enum ControlMode : uint64_t {
     kPositionControl,
 };
 
+constexpr uint32_t kTrapTrajInputMode = 5;
+
 ODriveCanNode::ODriveCanNode(const std::string& node_name) : rclcpp::Node(node_name) {
     
     rclcpp::Node::declare_parameter<std::string>("interface", "can0");
     rclcpp::Node::declare_parameter<uint16_t>("node_id", 0);
     rclcpp::Node::declare_parameter<bool>("axis_idle_on_shutdown", false);
+    rclcpp::Node::declare_parameter<int>("heartbeat_timeout_ms", 1000);
+    rclcpp::Node::declare_parameter<int>("request_timeout_ms", 2000);
+    rclcpp::Node::declare_parameter<double>("trap_vel_limit", 0.0);
+    rclcpp::Node::declare_parameter<double>("trap_accel_limit", 0.0);
+    rclcpp::Node::declare_parameter<double>("trap_decel_limit", 0.0);
 
     rclcpp::QoS ctrl_stat_qos(rclcpp::KeepAll{});
     ctrl_publisher_ = rclcpp::Node::create_publisher<ControllerStatus>("controller_status", ctrl_stat_qos);
@@ -77,7 +87,35 @@ bool ODriveCanNode::init(EpollEventLoop* event_loop) {
 
     node_id_ = rclcpp::Node::get_parameter("node_id").as_int();
     axis_idle_on_shutdown_ = rclcpp::Node::get_parameter("axis_idle_on_shutdown").as_bool();
+    const auto heartbeat_timeout_ms = rclcpp::Node::get_parameter("heartbeat_timeout_ms").as_int();
+    const auto request_timeout_ms = rclcpp::Node::get_parameter("request_timeout_ms").as_int();
+    trap_vel_limit_ = rclcpp::Node::get_parameter("trap_vel_limit").as_double();
+    trap_accel_limit_ = rclcpp::Node::get_parameter("trap_accel_limit").as_double();
+    trap_decel_limit_ = rclcpp::Node::get_parameter("trap_decel_limit").as_double();
     std::string interface = rclcpp::Node::get_parameter("interface").as_string();
+
+    if (heartbeat_timeout_ms <= 0 || request_timeout_ms <= 0) {
+        RCLCPP_ERROR(
+            rclcpp::Node::get_logger(),
+            "heartbeat_timeout_ms and request_timeout_ms must be positive"
+        );
+        return false;
+    }
+    heartbeat_timeout_ = std::chrono::milliseconds(heartbeat_timeout_ms);
+    request_timeout_ = std::chrono::milliseconds(request_timeout_ms);
+
+    const bool has_any_trap_limit =
+        trap_vel_limit_ != 0.0 || trap_accel_limit_ != 0.0 || trap_decel_limit_ != 0.0;
+    const bool has_all_trap_limits =
+        trap_vel_limit_ > 0.0 && trap_accel_limit_ > 0.0 && trap_decel_limit_ > 0.0;
+    if (has_any_trap_limit && !has_all_trap_limits) {
+        RCLCPP_ERROR(
+            rclcpp::Node::get_logger(),
+            "trap_vel_limit, trap_accel_limit and trap_decel_limit must all be positive or all be zero"
+        );
+        return false;
+    }
+    trap_traj_limits_enabled_ = has_all_trap_limits;
 
     if (!can_intf_.init(interface, event_loop, std::bind(&ODriveCanNode::recv_callback, this, _1))) {
         RCLCPP_ERROR(rclcpp::Node::get_logger(), "Failed to initialize socket can interface: %s", interface.c_str());
@@ -107,13 +145,29 @@ void ODriveCanNode::recv_callback(const can_frame& frame) {
     switch(frame.can_id & 0x1F) {
         case CmdId::kHeartbeat: {
             if (!verify_length("kHeartbeat", 8, frame.can_dlc)) break;
-            std::lock_guard<std::mutex> guard(ctrl_stat_mutex_);
-            ctrl_stat_.active_errors    = read_le<uint32_t>(frame.data + 0);
-            ctrl_stat_.axis_state        = read_le<uint8_t>(frame.data + 4);
-            ctrl_stat_.procedure_result  = read_le<uint8_t>(frame.data + 5);
-            ctrl_stat_.trajectory_done_flag = read_le<bool>(frame.data + 6);
-            ctrl_pub_flag_ |= 0b0001;
-            fresh_heartbeat_.notify_one();
+            const auto now = std::chrono::steady_clock::now();
+            bool connection_recovered;
+            {
+                std::lock_guard<std::mutex> guard(ctrl_stat_mutex_);
+                connection_recovered =
+                    !heartbeat_received_ || now - last_heartbeat_ > heartbeat_timeout_;
+                ctrl_stat_.active_errors    = read_le<uint32_t>(frame.data + 0);
+                ctrl_stat_.axis_state        = read_le<uint8_t>(frame.data + 4);
+                ctrl_stat_.procedure_result  = read_le<uint8_t>(frame.data + 5);
+                ctrl_stat_.trajectory_done_flag = read_le<bool>(frame.data + 6);
+                ctrl_pub_flag_ |= 0b0001;
+                heartbeat_received_ = true;
+                last_heartbeat_ = now;
+                ++heartbeat_generation_;
+            }
+            fresh_heartbeat_.notify_all();
+
+            if (connection_recovered) {
+                std::lock_guard<std::mutex> guard(axis_state_mutex_);
+                axis_state_sent_ = false;
+                clear_errors_requested_ = false;
+            }
+            try_send_axis_state_request(ctrl_stat_.active_errors);
             break;
         }
         case CmdId::kGetError: {
@@ -169,6 +223,8 @@ void ODriveCanNode::recv_callback(const can_frame& frame) {
         case CmdId::kSetInputPos:
         case CmdId::kSetInputVel:
         case CmdId::kSetInputTorque:
+        case CmdId::kSetTrajVelLimit:
+        case CmdId::kSetTrajAccelLimits:
         case CmdId::kClearErrors: {
             break; // Ignore commands coming from another master/host on the bus
         }
@@ -199,26 +255,97 @@ void ODriveCanNode::service_callback(const std::shared_ptr<AxisState::Request> r
     {
         std::unique_lock<std::mutex> guard(axis_state_mutex_);
         axis_state_ = request->axis_requested_state;
+        axis_state_requested_ = true;
+        axis_state_sent_ = false;
+        clear_errors_requested_ = false;
         RCLCPP_INFO(rclcpp::Node::get_logger(), "requesting axis state: %d", axis_state_);
     }
-    srv_evt_.set();
 
-    // Wait for at least 1 second for a new heartbeat to arrive.
-    // If the requested state is something other than CLOSED_LOOP_CONTROL, also
-    // wait for the procedure to complete (procedure_result != BUSY).
+    uint64_t initial_heartbeat_generation;
+    bool heartbeat_available;
+    {
+        std::lock_guard<std::mutex> guard(ctrl_stat_mutex_);
+        initial_heartbeat_generation = heartbeat_generation_;
+        heartbeat_available =
+            heartbeat_received_ &&
+            std::chrono::steady_clock::now() - last_heartbeat_ <= heartbeat_timeout_;
+    }
+    if (heartbeat_available) {
+        uint32_t active_errors;
+        {
+            std::lock_guard<std::mutex> guard(ctrl_stat_mutex_);
+            active_errors = ctrl_stat_.active_errors;
+        }
+        try_send_axis_state_request(active_errors);
+    } else {
+        RCLCPP_INFO(
+            rclcpp::Node::get_logger(),
+            "Waiting for heartbeat from ODrive node %u before sending axis state",
+            node_id_
+        );
+    }
+
+    // Wait for a heartbeat confirming CLOSED_LOOP_CONTROL. For other requested
+    // states, wait for the procedure to complete (procedure_result != BUSY).
     std::unique_lock<std::mutex> guard(ctrl_stat_mutex_); // define lock for controller status
-    auto call_time = std::chrono::steady_clock::now();
-    fresh_heartbeat_.wait(guard, [this, &call_time, &request]() {
+    const bool completed = fresh_heartbeat_.wait_for(guard, request_timeout_, [this, initial_heartbeat_generation, &request]() {
+        if (heartbeat_generation_ <= initial_heartbeat_generation) {
+            return false;
+        }
         bool is_busy = this->ctrl_stat_.procedure_result == ODriveProcedureResult::PROCEDURE_RESULT_BUSY;
         bool requested_closed_loop = request->axis_requested_state == ODriveAxisState::AXIS_STATE_CLOSED_LOOP_CONTROL;
-        bool minimum_time_passed = (std::chrono::steady_clock::now() - call_time >= std::chrono::seconds(1));
-        bool complete = (requested_closed_loop || !is_busy) && minimum_time_passed;
+        bool reached_requested_state = this->ctrl_stat_.axis_state == request->axis_requested_state;
+        bool complete = requested_closed_loop ? reached_requested_state : !is_busy;
         return complete;
         }); // wait for procedure_result
+
+    if (!completed) {
+        RCLCPP_WARN(
+            rclcpp::Node::get_logger(),
+            "Timed out after %ld ms waiting for ODrive node %u; the request will be retried when heartbeat communication resumes",
+            request_timeout_.count(),
+            node_id_
+        );
+    }
     
     response->axis_state = ctrl_stat_.axis_state;
     response->active_errors = ctrl_stat_.active_errors;
     response->procedure_result = ctrl_stat_.procedure_result;
+}
+
+void ODriveCanNode::try_send_axis_state_request(uint32_t active_errors) {
+    std::lock_guard<std::mutex> guard(axis_state_mutex_);
+    if (!axis_state_requested_ || axis_state_sent_) {
+        return;
+    }
+
+    if (active_errors & ODriveError::ODRIVE_ERROR_INITIALIZING) {
+        return;
+    }
+
+    if (active_errors != ODriveError::ODRIVE_ERROR_NONE) {
+        if (!clear_errors_requested_) {
+            RCLCPP_WARN(
+                rclcpp::Node::get_logger(),
+                "ODrive node %u reported active_errors=0x%08x; clearing errors before sending axis state",
+                node_id_,
+                active_errors
+            );
+            srv_clear_errors_evt_.set();
+            clear_errors_requested_ = true;
+        }
+        return;
+    }
+
+    RCLCPP_INFO(
+        rclcpp::Node::get_logger(),
+        "Sending requested axis state %u to ODrive node %u",
+        axis_state_,
+        node_id_
+    );
+    axis_state_sent_ = true;
+    clear_errors_requested_ = false;
+    srv_evt_.set();
 }
 
 void ODriveCanNode::service_clear_errors_callback(const std::shared_ptr<Empty::Request> /*request*/, std::shared_ptr<Empty::Response> /*response*/) {
@@ -261,6 +388,7 @@ void ODriveCanNode::request_clear_errors_callback() {
 void ODriveCanNode::ctrl_msg_callback() {
 
     uint32_t control_mode;
+    uint32_t input_mode;
     struct can_frame frame;
     frame.can_id = node_id_ << 5 | kSetControllerMode;
     {
@@ -268,6 +396,22 @@ void ODriveCanNode::ctrl_msg_callback() {
         write_le<uint32_t>(ctrl_msg_.control_mode, frame.data);
         write_le<uint32_t>(ctrl_msg_.input_mode,   frame.data + 4);
         control_mode = ctrl_msg_.control_mode;
+        input_mode = ctrl_msg_.input_mode;
+    }
+
+    if (input_mode == kTrapTrajInputMode && trap_traj_limits_enabled_) {
+        struct can_frame limit_frame = {};
+        limit_frame.can_id = node_id_ << 5 | CmdId::kSetTrajVelLimit;
+        write_le<float>(static_cast<float>(trap_vel_limit_ / (2 * M_PI)), limit_frame.data);
+        limit_frame.can_dlc = 4;
+        can_intf_.send_can_frame(limit_frame);
+
+        limit_frame = can_frame{};
+        limit_frame.can_id = node_id_ << 5 | CmdId::kSetTrajAccelLimits;
+        write_le<float>(static_cast<float>(trap_accel_limit_ / (2 * M_PI)), limit_frame.data);
+        write_le<float>(static_cast<float>(trap_decel_limit_ / (2 * M_PI)), limit_frame.data + 4);
+        limit_frame.can_dlc = 8;
+        can_intf_.send_can_frame(limit_frame);
     }
     frame.can_dlc = 8;
     can_intf_.send_can_frame(frame);

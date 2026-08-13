@@ -14,6 +14,7 @@
 #include <condition_variable>
 #include <array>
 #include <algorithm>
+#include <chrono>
 #include <linux/can.h>
 #include <linux/can/raw.h>
 
@@ -40,6 +41,7 @@ private:
     void request_state_callback();
     void request_clear_errors_callback();
     void ctrl_msg_callback();
+    void try_send_axis_state_request(uint32_t active_errors);
     inline bool verify_length(const std::string&name, uint8_t expected, uint8_t length);
     
     uint16_t node_id_;
@@ -62,10 +64,23 @@ private:
     rclcpp::Subscription<ControlMessage>::SharedPtr subscriber_;
 
     EpollEvent srv_evt_;
-    uint32_t axis_state_;
+    uint32_t axis_state_ = 0;
+    bool axis_state_requested_ = false;
+    bool axis_state_sent_ = false;
+    bool clear_errors_requested_ = false;
     std::mutex axis_state_mutex_;
     std::condition_variable fresh_heartbeat_;
+    uint64_t heartbeat_generation_ = 0;
+    bool heartbeat_received_ = false;
+    std::chrono::steady_clock::time_point last_heartbeat_;
+    std::chrono::milliseconds heartbeat_timeout_{1000};
+    std::chrono::milliseconds request_timeout_{2000};
     rclcpp::Service<AxisState>::SharedPtr service_;
+
+    double trap_vel_limit_ = 0.0;
+    double trap_accel_limit_ = 0.0;
+    double trap_decel_limit_ = 0.0;
+    bool trap_traj_limits_enabled_ = false;
 
     EpollEvent srv_clear_errors_evt_;
     rclcpp::Service<Empty>::SharedPtr service_clear_errors_;
