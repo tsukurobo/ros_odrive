@@ -41,6 +41,7 @@ private:
     void start_index_search(Axis& axis);
     void update_index_search(Axis& axis);
     void update_connection(Axis& axis);
+    void synchronize_commands_to_state(Axis& axis);
 
     bool active_ = false;
     EpollEventLoop event_loop_;
@@ -336,6 +337,9 @@ return_type ODriveHardwareInterface::perform_command_mode_switch(
         for (const std::string& key : start_interfaces) {
             for (auto& kv : interfaces) {
                 if (kv.first == key) {
+                    if (kv.first == info_.joints[i].name + "/" + hardware_interface::HW_IF_POSITION) {
+                        synchronize_commands_to_state(axis);
+                    }
                     *kv.second = true;
                     mode_switch = true;
                 }
@@ -427,6 +431,7 @@ void ODriveHardwareInterface::update_connection(Axis& axis) {
     if (axis.index_search_on_activate_) {
         start_index_search(axis);
     } else {
+        synchronize_commands_to_state(axis);
         set_axis_command_mode(axis);
     }
 }
@@ -507,6 +512,7 @@ void ODriveHardwareInterface::update_index_search(Axis& axis) {
         if (axis.axis_error_ == ODRIVE_ERROR_NONE &&
             axis.procedure_result_ == PROCEDURE_RESULT_SUCCESS) {
             axis.ready_for_control_ = true;
+            synchronize_commands_to_state(axis);
             RCLCPP_INFO(
                 rclcpp::get_logger("ODriveHardwareInterface"),
                 "Encoder index search completed for ODrive node %u",
@@ -523,6 +529,27 @@ void ODriveHardwareInterface::update_index_search(Axis& axis) {
             );
         }
     }
+}
+
+void ODriveHardwareInterface::synchronize_commands_to_state(Axis& axis) {
+    if (!std::isfinite(axis.pos_estimate_)) {
+        RCLCPP_WARN(
+            rclcpp::get_logger("ODriveHardwareInterface"),
+            "Cannot synchronize position command for ODrive node %u: no position estimate",
+            axis.node_id_
+        );
+        return;
+    }
+
+    axis.pos_setpoint_ = axis.pos_estimate_;
+    axis.vel_setpoint_ = 0.0;
+    axis.torque_setpoint_ = 0.0;
+    RCLCPP_INFO(
+        rclcpp::get_logger("ODriveHardwareInterface"),
+        "Synchronized command for ODrive node %u to current position %.6f rad",
+        axis.node_id_,
+        axis.pos_estimate_
+    );
 }
 
 void ODriveHardwareInterface::set_axis_command_mode(Axis& axis) {
