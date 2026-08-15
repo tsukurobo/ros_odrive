@@ -86,7 +86,11 @@ struct Axis {
     // uint8_t axis_state_ = 0;
     // uint8_t procedure_result_ = 0;
     // uint8_t trajectory_done_flag_ = 0;
-    double pos_estimate_ = NAN; // [rad]
+    // Keep the exported position finite before the first encoder frame so
+    // robot_state_publisher never generates an invalid transform. Track
+    // validity separately so this placeholder is not used as a command.
+    double pos_estimate_ = 0.0; // [rad]
+    bool encoder_estimate_received_ = false;
     double vel_estimate_ = NAN; // [rad/s]
     double iq_setpoint_ = NAN; // [A]
     double iq_measured_ = NAN; // [A]
@@ -384,6 +388,7 @@ void ODriveHardwareInterface::update_connection(Axis& axis) {
         axis.index_search_requested_ = false;
         axis.index_search_started_ = false;
         axis.ready_for_control_ = !axis.index_search_on_activate_;
+        axis.encoder_estimate_received_ = false;
     }
 
     if (axis.connection_recovered_) {
@@ -532,7 +537,7 @@ void ODriveHardwareInterface::update_index_search(Axis& axis) {
 }
 
 void ODriveHardwareInterface::synchronize_commands_to_state(Axis& axis) {
-    if (!std::isfinite(axis.pos_estimate_)) {
+    if (!axis.encoder_estimate_received_ || !std::isfinite(axis.pos_estimate_)) {
         RCLCPP_WARN(
             rclcpp::get_logger("ODriveHardwareInterface"),
             "Cannot synchronize position command for ODrive node %u: no position estimate",
@@ -645,8 +650,13 @@ void Axis::on_can_msg(const rclcpp::Time&, const can_frame& frame) {
         } break;
         case Get_Encoder_Estimates_msg_t::cmd_id: {
             if (Get_Encoder_Estimates_msg_t msg; try_decode(msg)) {
-                pos_estimate_ = msg.Pos_Estimate * (2 * M_PI);
-                vel_estimate_ = msg.Vel_Estimate * (2 * M_PI);
+                const double position = msg.Pos_Estimate * (2 * M_PI);
+                const double velocity = msg.Vel_Estimate * (2 * M_PI);
+                if (std::isfinite(position) && std::isfinite(velocity)) {
+                    pos_estimate_ = position;
+                    vel_estimate_ = velocity;
+                    encoder_estimate_received_ = true;
+                }
             }
         } break;
         case Get_Torques_msg_t::cmd_id: {
